@@ -1,0 +1,259 @@
+package server
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"sort"
+	"strconv"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/sonni-a/distributed-grep/internal/grep"
+	"github.com/sonni-a/distributed-grep/internal/protocol"
+)
+
+var jobSeq atomic.Uint64
+
+func newJobID() string {
+	return strconv.FormatUint(jobSeq.Add(1), 10)
+}
+
+func (s *Server) isSelf(addr string) bool {
+	return protocol.SameNodeAddr(addr, s.cfg.Advertise)
+}
+
+func (s *Server) clusterOf(req protocol.GrepRequest) []string {
+	if len(s.cfg.Peers) > 0 {
+		return s.cfg.Peers
+	}
+	if len(req.Cluster) > 0 {
+		return req.Cluster
+	}
+	return []string{s.cfg.Advertise}
+}
+
+func (s *Server) registerJob(id string, buf int) chan protocol.FragmentResult {
+	ch := make(chan protocol.FragmentResult, buf)
+	s.mu.Lock()
+	s.collectors[id] = ch
+	s.mu.Unlock()
+	return ch
+}
+
+func (s *Server) unregisterJob(id string) {
+	s.mu.Lock()
+	delete(s.collectors, id)
+	s.mu.Unlock()
+}
+
+func (s *Server) deliver(res protocol.FragmentResult) {
+	s.mu.Lock()
+	ch, ok := s.collectors[res.JobID]
+	s.mu.Unlock()
+	if !ok {
+		return
+	}
+	select {
+	case ch <- res:
+	default:
+	}
+}
+
+func (s *Server) announce(ctx context.Context, cluster []string, res protocol.FragmentResult) {
+	var wg sync.WaitGroup
+	for _, addr := range cluster {
+		if s.isSelf(addr) {
+			s.deliver(res)
+			continue
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = s.postJSON(ctx, addr, "/result", res)
+		}()
+	}
+	wg.Wait()
+}
+
+func (s *Server) liveNodes(ctx context.Context, cluster []string) []string {
+	type pingRes struct {
+		addr string
+		ok   bool
+	}
+	ch := make(chan pingRes, len(cluster))
+	var wg sync.WaitGroup
+	for _, addr := range cluster {
+		if s.isSelf(addr) {
+			ch <- pingRes{addr: addr, ok: true}
+			continue
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ch <- pingRes{addr: addr, ok: protocol.Ping(ctx, s.httpc, addr)}
+		}()
+	}
+	wg.Wait()
+	close(ch)
+
+	alive := make(map[string]bool)
+	for r := range ch {
+		if r.ok {
+			alive[r.addr] = true
+		}
+	}
+	var healthy []string
+	for _, addr := range cluster {
+		if alive[addr] {
+			healthy = append(healthy, addr)
+		}
+	}
+	return healthy
+}
+
+func (s *Server) postJSON(ctx context.Context, addr, path string, payload any) error {
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://"+addr+path, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := s.httpc.Do(req)
+	if err != nil {
+		return fmt.Errorf("%s: %w", addr, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		b, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("%s %s: status %d: %s", addr, path, resp.StatusCode, string(b))
+	}
+	return nil
+}
+
+func (s *Server) dispatchFragment(ctx context.Context, cluster []string, addr string, frag protocol.FragmentRequest) {
+	if s.isSelf(addr) {
+		go func() {
+			s.announce(ctx, cluster, s.processFragment(frag))
+		}()
+		return
+	}
+	go func() {
+		if err := s.postJSON(ctx, addr, "/fragment", frag); err != nil {
+			s.deliver(protocol.FragmentResult{
+				JobID:   frag.JobID,
+				NodeID:  addr,
+				ShardID: frag.ShardID,
+				Error:   err.Error(),
+			})
+		}
+	}()
+}
+
+func (s *Server) coordinate(ctx context.Context, req protocol.GrepRequest) protocol.GrepResponse {
+	cluster := s.clusterOf(req)
+	n := len(cluster)
+	quorum := protocol.QuorumRequired(n)
+	out := func(succeeded int, matches []grep.Match, err string) protocol.GrepResponse {
+		return protocol.GrepResponse{
+			Matches:   matches,
+			NodeID:    s.cfg.NodeID,
+			Succeeded: succeeded,
+			Quorum:    quorum,
+			Cluster:   n,
+			Error:     err,
+		}
+	}
+
+	healthy := s.liveNodes(ctx, cluster)
+	if len(healthy) < quorum {
+		return out(len(healthy), nil, fmt.Sprintf("quorum not met: need %d healthy servers, got %d", quorum, len(healthy)))
+	}
+	if len(req.Lines) == 0 {
+		return out(len(healthy), nil, "")
+	}
+
+	shards := protocol.SplitShards(req.Lines, quorum)
+	work := append([]protocol.Shard(nil), shards...)
+	for len(work) < quorum {
+		work = append(work, shards[len(work)%len(shards)])
+	}
+
+	jobID := newJobID()
+	results := s.registerJob(jobID, n+len(healthy))
+	defer s.unregisterJob(jobID)
+
+	makeFrag := func(sh protocol.Shard) protocol.FragmentRequest {
+		return protocol.FragmentRequest{
+			JobID:     jobID,
+			Pattern:   req.Pattern,
+			Lines:     sh.Lines,
+			StartLine: sh.StartLine,
+			ShardID:   sh.ID,
+			Filename:  req.Filename,
+			Options:   req.Options,
+			Cluster:   cluster,
+		}
+	}
+
+	spares := healthy[len(work):]
+	for i, sh := range work {
+		s.dispatchFragment(ctx, cluster, healthy[i], makeFrag(sh))
+	}
+
+	got := make(map[int]protocol.FragmentResult, len(shards))
+	ok := 0
+	deadline := time.NewTimer(30 * time.Second)
+	defer deadline.Stop()
+
+	for ok < quorum || len(got) < len(shards) {
+		select {
+		case res := <-results:
+			if res.Error != "" {
+				if len(spares) == 0 {
+					return out(ok, nil, fmt.Sprintf("shard %d on %s: %s", res.ShardID, res.NodeID, res.Error))
+				}
+				var sh protocol.Shard
+				for _, x := range shards {
+					if x.ID == res.ShardID {
+						sh = x
+						break
+					}
+				}
+				addr := spares[0]
+				spares = spares[1:]
+				s.dispatchFragment(ctx, cluster, addr, makeFrag(sh))
+				continue
+			}
+			ok++
+			if _, exists := got[res.ShardID]; !exists {
+				got[res.ShardID] = res
+			}
+
+		case <-ctx.Done():
+			return out(ok, nil, ctx.Err().Error())
+
+		case <-deadline.C:
+			return out(ok, nil, fmt.Sprintf("timeout waiting for quorum: %d/%d succeeded (need %d)", ok, len(work), quorum))
+		}
+	}
+
+	var merged []grep.Match
+	for _, sh := range shards {
+		merged = append(merged, got[sh.ID].Matches...)
+	}
+	sort.Slice(merged, func(i, j int) bool {
+		if merged[i].Filename != merged[j].Filename {
+			return merged[i].Filename < merged[j].Filename
+		}
+		return merged[i].LineNum < merged[j].LineNum
+	})
+	return out(ok, merged, "")
+}

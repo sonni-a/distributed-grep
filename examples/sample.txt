@@ -1,0 +1,20 @@
+2024-01-15 info: service started
+2024-01-15 error: connection refused
+2024-01-16 warn: high memory usage
+2024-01-16 info: retry succeeded
+2024-01-17 ERROR: database timeout
+2024-01-17 debug: cache hit
+2024-01-18 warn: disk space low
+2024-01-18 info: backup complete
+2024-01-19 error: permission denied
+2024-01-19 info: shutdown initiated
+2024-01-20 notice: update available
+2024-01-20 error: disk full
+2024-01-21 info: cleanup finished
+2024-01-21 warn: latency spike detected
+2024-01-22 debug: heartbeat ok
+2024-01-22 error: network unreachable
+2024-01-23 info: config reloaded
+2024-01-23 warn: deprecated API used
+2024-01-24 info: all systems nominal
+2024-01-24 error: authentication failed

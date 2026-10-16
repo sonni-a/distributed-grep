@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -208,6 +209,94 @@ func TestTinyFileKeepsMatchWhenReplicaFails(t *testing.T) {
 	}
 }
 
+func TestFailoverWhenFirstEntryDropsGrep(t *testing.T) {
+	real := startTestCluster(t, 1, true)
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"node_id":"drop","healthy":true}`)
+	})
+	mux.HandleFunc("/grep", func(w http.ResponseWriter, _ *http.Request) {
+		hj, ok := w.(http.Hijacker)
+		if !ok {
+			http.Error(w, "no hijack", http.StatusInternalServerError)
+			return
+		}
+		conn, _, err := hj.Hijack()
+		if err != nil {
+			return
+		}
+		conn.Close()
+	})
+	drop := &http.Server{Handler: mux}
+	go drop.Serve(ln)
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = drop.Shutdown(ctx)
+	})
+
+	path := filepath.Join(t.TempDir(), "one.txt")
+	if err := os.WriteFile(path, []byte("only one error line\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := distGrep(t, []string{ln.Addr().String(), real[0]}, "error", grep.Options{LineNumber: true}, path, 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].Line != "only one error line" || got[0].LineNum != 1 {
+		t.Fatalf("got %+v", got)
+	}
+}
+
+func TestHealthCheckDoesNotWaitForSilentServer(t *testing.T) {
+	real := startTestCluster(t, 1, false)
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var mu sync.Mutex
+	var conns []net.Conn
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			mu.Lock()
+			conns = append(conns, c)
+			mu.Unlock()
+		}
+	}()
+	t.Cleanup(func() {
+		_ = ln.Close()
+		mu.Lock()
+		defer mu.Unlock()
+		for _, c := range conns {
+			_ = c.Close()
+		}
+	})
+
+	start := time.Now()
+	healthy := client.New(client.Config{
+		Servers: []string{ln.Addr().String(), real[0]},
+		Timeout: 20 * time.Second,
+	}).CheckHealth(context.Background())
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("health check took %s; a silent address should not use the full request timeout", elapsed)
+	}
+	if len(healthy) != 1 || healthy[0] != real[0] {
+		t.Fatalf("healthy = %v, want [%s]", healthy, real[0])
+	}
+}
+
 func TestSlowFragmentFinishesWithinJobDeadline(t *testing.T) {
 	real := startTestCluster(t, 1, false)
 
@@ -226,7 +315,6 @@ func TestSlowFragmentFinishesWithinJobDeadline(t *testing.T) {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		// Longer than the old 15s HTTP client timeout, shorter than the 30s job wait.
 		time.Sleep(16 * time.Second)
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(protocol.FragmentResult{

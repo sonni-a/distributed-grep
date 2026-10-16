@@ -5,9 +5,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"sort"
 	"sync"
@@ -16,6 +18,8 @@ import (
 	"github.com/sonni-a/distributed-grep/internal/grep"
 	"github.com/sonni-a/distributed-grep/internal/protocol"
 )
+
+const healthTimeout = 2 * time.Second
 
 type Config struct {
 	Servers []string
@@ -53,9 +57,9 @@ func CloseReaders(readers []NamedReader) {
 }
 
 func (d *DistributedGrep) RunDistributed(ctx context.Context, pattern string, opts grep.Options, readers []NamedReader) ([]grep.Match, error) {
-	entry, err := d.firstHealthy(ctx)
-	if err != nil {
-		return nil, err
+	entries := d.CheckHealth(ctx)
+	if len(entries) == 0 {
+		return nil, fmt.Errorf("no healthy servers among %v", d.cfg.Servers)
 	}
 
 	showFilename := len(readers) > 1
@@ -70,7 +74,14 @@ func (d *DistributedGrep) RunDistributed(ctx context.Context, pattern string, op
 		if showFilename {
 			name = nr.Name
 		}
-		resp, err := d.submit(ctx, entry, pattern, opts, lines, name)
+		var resp protocol.GrepResponse
+		for len(entries) > 0 {
+			resp, err = d.submit(ctx, entries[0], pattern, opts, lines, name)
+			if err == nil || !entryUnavailable(err) {
+				break
+			}
+			entries = entries[1:]
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -155,12 +166,9 @@ func RunLocal(pattern string, opts grep.Options, files []string) ([]grep.Match, 
 	return all, nil
 }
 
-func (d *DistributedGrep) firstHealthy(ctx context.Context) (string, error) {
-	healthy := d.CheckHealth(ctx)
-	if len(healthy) == 0 {
-		return "", fmt.Errorf("no healthy servers among %v", d.cfg.Servers)
-	}
-	return healthy[0], nil
+func entryUnavailable(err error) bool {
+	var urlErr *url.Error
+	return errors.As(err, &urlErr) || errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF)
 }
 
 func (d *DistributedGrep) CheckHealth(ctx context.Context) []string {
@@ -174,7 +182,9 @@ func (d *DistributedGrep) CheckHealth(ctx context.Context) []string {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			ch <- healthResult{addr: addr, ok: protocol.Ping(ctx, d.client, addr)}
+			pingCtx, cancel := context.WithTimeout(ctx, healthTimeout)
+			defer cancel()
+			ch <- healthResult{addr: addr, ok: protocol.Ping(pingCtx, d.client, addr)}
 		}()
 	}
 	wg.Wait()

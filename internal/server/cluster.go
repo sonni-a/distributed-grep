@@ -17,8 +17,6 @@ import (
 	"github.com/sonni-a/distributed-grep/internal/protocol"
 )
 
-// resultWait is how long a search waits for shard results.
-// A fragment call uses the same budget, so a finished shard is not failed early.
 const resultWait = 30 * time.Second
 
 var jobSeq atomic.Uint64

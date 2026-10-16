@@ -76,8 +76,14 @@ func (e *Engine) ScanLines(lines []string, startLine int, filename string) []Mat
 	return out
 }
 
+func NewLineScanner(r io.Reader) *bufio.Scanner {
+	s := bufio.NewScanner(r)
+	s.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	return s
+}
+
 func (e *Engine) ScanReader(r io.Reader, filename string) ([]Match, error) {
-	scanner := bufio.NewScanner(r)
+	scanner := NewLineScanner(r)
 	var out []Match
 	lineNum := 0
 	for scanner.Scan() {

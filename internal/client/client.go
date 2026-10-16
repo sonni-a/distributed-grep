@@ -1,7 +1,6 @@
 package client
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -11,7 +10,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"sort"
 	"sync"
 	"time"
 
@@ -87,13 +85,6 @@ func (d *DistributedGrep) RunDistributed(ctx context.Context, pattern string, op
 		}
 		allMatches = append(allMatches, resp.Matches...)
 	}
-
-	sort.Slice(allMatches, func(i, j int) bool {
-		if allMatches[i].Filename != allMatches[j].Filename {
-			return allMatches[i].Filename < allMatches[j].Filename
-		}
-		return allMatches[i].LineNum < allMatches[j].LineNum
-	})
 
 	return allMatches, nil
 }
@@ -206,8 +197,7 @@ func (d *DistributedGrep) CheckHealth(ctx context.Context) []string {
 }
 
 func readLines(r io.Reader) ([]string, error) {
-	scanner := bufio.NewScanner(r)
-	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	scanner := grep.NewLineScanner(r)
 	var lines []string
 	for scanner.Scan() {
 		lines = append(lines, scanner.Text())

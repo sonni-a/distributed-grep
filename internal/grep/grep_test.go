@@ -1,6 +1,7 @@
 package grep
 
 import (
+	"strings"
 	"testing"
 )
 
@@ -58,6 +59,21 @@ func TestEngine(t *testing.T) {
 				t.Fatalf("filename %q, want %q", got[0].Filename, tc.filename)
 			}
 		})
+	}
+}
+
+func TestScanReaderLongLine(t *testing.T) {
+	line := strings.Repeat("a", 100*1024) + " error"
+	e, err := NewEngine("error", Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := e.ScanReader(strings.NewReader(line+"\n"), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].Line != line || got[0].LineNum != 1 {
+		t.Fatalf("got %+v", got)
 	}
 }
 

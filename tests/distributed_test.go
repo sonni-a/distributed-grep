@@ -169,6 +169,38 @@ func TestDistributedTinyFileNoDuplicateMatches(t *testing.T) {
 	}
 }
 
+func TestDistributedPreservesFileOrder(t *testing.T) {
+	addrs := startTestCluster(t, 1, false)
+	dir := t.TempDir()
+	b := filepath.Join(dir, "b.txt")
+	a := filepath.Join(dir, "a.txt")
+	if err := os.WriteFile(b, []byte("error in b\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(a, []byte("error in a\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	files := []string{b, a}
+	opts := grep.Options{LineNumber: true}
+	local, err := client.RunLocal("error", opts, files)
+	if err != nil {
+		t.Fatal(err)
+	}
+	opened, err := client.OpenFiles(files)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.CloseReaders(opened)
+	dist, err := client.New(client.Config{Servers: addrs, Timeout: 5 * time.Second}).
+		RunDistributed(context.Background(), "error", opts, opened)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := grep.FormatMatches(dist, opts, true), grep.FormatMatches(local, opts, true); got != want {
+		t.Fatalf("got:\n%s\nwant:\n%s", got, want)
+	}
+}
+
 func TestTinyFileKeepsMatchWhenReplicaFails(t *testing.T) {
 	real := startTestCluster(t, 1, false)
 

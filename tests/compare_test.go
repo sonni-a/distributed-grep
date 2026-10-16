@@ -2,11 +2,11 @@ package compare_test
 
 import (
 	"bytes"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
-	"sort"
 	"strings"
 	"testing"
 
@@ -55,7 +55,6 @@ func normalizeOutput(s string) string {
 		return ""
 	}
 	lines := strings.Split(strings.TrimSuffix(s, "\n"), "\n")
-	sort.Strings(lines)
 	return strings.Join(lines, "\n") + "\n"
 }
 
@@ -81,5 +80,41 @@ func TestCompareWithSystemGrep(t *testing.T) {
 				t.Errorf("output mismatch\nsystem:\n%s\nmygrep:\n%s", sysOut, myOut)
 			}
 		})
+	}
+}
+
+func TestCLIExitCodes(t *testing.T) {
+	root := filepath.Dir(filepath.Dir(samplePath(t)))
+	bin := filepath.Join(t.TempDir(), "mygrep")
+	if runtime.GOOS == "windows" {
+		bin += ".exe"
+	}
+	build := exec.Command("go", "build", "-o", bin, "./cmd/mygrep")
+	build.Dir = root
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build: %v\n%s", err, out)
+	}
+	run := func(args ...string) int {
+		t.Helper()
+		cmd := exec.Command(bin, args...)
+		cmd.Dir = root
+		err := cmd.Run()
+		if err == nil {
+			return 0
+		}
+		var exit *exec.ExitError
+		if !errors.As(err, &exit) {
+			t.Fatal(err)
+		}
+		return exit.ExitCode()
+	}
+	if code := run("error", "examples/sample.txt"); code != 0 {
+		t.Fatalf("match: exit %d, want 0", code)
+	}
+	if code := run("no-such-pattern-xyz", "examples/sample.txt"); code != 1 {
+		t.Fatalf("no match: exit %d, want 1", code)
+	}
+	if code := run("[", "examples/sample.txt"); code != 2 {
+		t.Fatalf("bad pattern: exit %d, want 2", code)
 	}
 }

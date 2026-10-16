@@ -122,7 +122,7 @@ func runGrep(args []string) {
 
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
-		os.Exit(1)
+		os.Exit(2)
 	}
 
 	if len(matches) > 0 {

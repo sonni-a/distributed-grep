@@ -17,6 +17,10 @@ import (
 	"github.com/sonni-a/distributed-grep/internal/protocol"
 )
 
+// resultWait is how long a search waits for shard results.
+// A fragment call uses the same budget, so a finished shard is not failed early.
+const resultWait = 30 * time.Second
+
 var jobSeq atomic.Uint64
 
 func newJobID() string {
@@ -51,7 +55,7 @@ func (s *Server) unregisterJob(id string) {
 	s.mu.Unlock()
 }
 
-func (s *Server) deliver(res protocol.FragmentResult) {
+func (s *Server) deliver(ctx context.Context, res protocol.FragmentResult) {
 	s.mu.Lock()
 	ch, ok := s.collectors[res.JobID]
 	s.mu.Unlock()
@@ -60,24 +64,8 @@ func (s *Server) deliver(res protocol.FragmentResult) {
 	}
 	select {
 	case ch <- res:
-	default:
+	case <-ctx.Done():
 	}
-}
-
-func (s *Server) announce(ctx context.Context, cluster []string, res protocol.FragmentResult) {
-	var wg sync.WaitGroup
-	for _, addr := range cluster {
-		if s.isSelf(addr) {
-			s.deliver(res)
-			continue
-		}
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			_ = s.postJSON(ctx, addr, "/result", res)
-		}()
-	}
-	wg.Wait()
 }
 
 func (s *Server) liveNodes(ctx context.Context, cluster []string) []string {
@@ -116,44 +104,56 @@ func (s *Server) liveNodes(ctx context.Context, cluster []string) []string {
 	return healthy
 }
 
-func (s *Server) postJSON(ctx context.Context, addr, path string, payload any) error {
-	body, err := json.Marshal(payload)
+func (s *Server) callFragment(ctx context.Context, addr string, frag protocol.FragmentRequest) (protocol.FragmentResult, error) {
+	body, err := json.Marshal(frag)
 	if err != nil {
-		return err
+		return protocol.FragmentResult{}, err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://"+addr+path, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://"+addr+"/fragment", bytes.NewReader(body))
 	if err != nil {
-		return err
+		return protocol.FragmentResult{}, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := s.httpc.Do(req)
+	resp, err := s.fragments.Do(req)
 	if err != nil {
-		return fmt.Errorf("%s: %w", addr, err)
+		return protocol.FragmentResult{}, fmt.Errorf("%s: %w", addr, err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
-		b, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("%s %s: status %d: %s", addr, path, resp.StatusCode, string(b))
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
+		return protocol.FragmentResult{}, fmt.Errorf("%s /fragment: status %d: %s", addr, resp.StatusCode, bytes.TrimSpace(b))
 	}
-	return nil
+	var res protocol.FragmentResult
+	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
+		return protocol.FragmentResult{}, fmt.Errorf("%s /fragment: %w", addr, err)
+	}
+	if res.JobID == "" {
+		res.JobID = frag.JobID
+	}
+	if res.NodeID == "" {
+		res.NodeID = addr
+	}
+	return res, nil
 }
 
-func (s *Server) dispatchFragment(ctx context.Context, cluster []string, addr string, frag protocol.FragmentRequest) {
+func (s *Server) dispatchFragment(ctx context.Context, addr string, frag protocol.FragmentRequest) {
 	if s.isSelf(addr) {
 		go func() {
-			s.announce(ctx, cluster, s.processFragment(frag))
+			s.deliver(ctx, s.processFragment(frag))
 		}()
 		return
 	}
 	go func() {
-		if err := s.postJSON(ctx, addr, "/fragment", frag); err != nil {
-			s.deliver(protocol.FragmentResult{
+		res, err := s.callFragment(ctx, addr, frag)
+		if err != nil {
+			res = protocol.FragmentResult{
 				JobID:   frag.JobID,
 				NodeID:  addr,
 				ShardID: frag.ShardID,
 				Error:   err.Error(),
-			})
+			}
 		}
+		s.deliver(ctx, res)
 	}()
 }
 
@@ -206,13 +206,13 @@ func (s *Server) coordinate(ctx context.Context, req protocol.GrepRequest) proto
 	spares := healthy[len(work):]
 	pending := make(map[int]int)
 	for i, sh := range work {
-		s.dispatchFragment(ctx, cluster, healthy[i], makeFrag(sh))
+		s.dispatchFragment(ctx, healthy[i], makeFrag(sh))
 		pending[sh.ID]++
 	}
 
 	got := make(map[int]protocol.FragmentResult, len(shards))
 	ok := 0
-	deadline := time.NewTimer(30 * time.Second)
+	deadline := time.NewTimer(resultWait)
 	defer deadline.Stop()
 
 	for len(got) < len(shards) {
@@ -246,7 +246,7 @@ func (s *Server) coordinate(ctx context.Context, req protocol.GrepRequest) proto
 				addr := spares[0]
 				spares = spares[1:]
 				pending[sh.ID]++
-				s.dispatchFragment(ctx, cluster, addr, makeFrag(sh))
+				s.dispatchFragment(ctx, addr, makeFrag(sh))
 				continue
 			}
 			ok++

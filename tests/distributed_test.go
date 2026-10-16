@@ -2,6 +2,7 @@ package compare_test
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net"
 	"net/http"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/sonni-a/distributed-grep/internal/client"
 	"github.com/sonni-a/distributed-grep/internal/grep"
+	"github.com/sonni-a/distributed-grep/internal/protocol"
 	"github.com/sonni-a/distributed-grep/internal/server"
 )
 
@@ -198,6 +200,55 @@ func TestTinyFileKeepsMatchWhenReplicaFails(t *testing.T) {
 	}
 
 	got, err := distGrep(t, []string{real[0], ln.Addr().String()}, "error", grep.Options{LineNumber: true}, path, 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].Line != "only one error line" || got[0].LineNum != 1 {
+		t.Fatalf("got %+v", got)
+	}
+}
+
+func TestSlowFragmentFinishesWithinJobDeadline(t *testing.T) {
+	real := startTestCluster(t, 1, false)
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"node_id":"slow","healthy":true}`)
+	})
+	mux.HandleFunc("/fragment", func(w http.ResponseWriter, r *http.Request) {
+		var req protocol.FragmentRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		// Longer than the old 15s HTTP client timeout, shorter than the 30s job wait.
+		time.Sleep(16 * time.Second)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(protocol.FragmentResult{
+			JobID:   req.JobID,
+			NodeID:  "slow",
+			ShardID: req.ShardID,
+		})
+	})
+	slow := &http.Server{Handler: mux}
+	go slow.Serve(ln)
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = slow.Shutdown(ctx)
+	})
+
+	path := filepath.Join(t.TempDir(), "two.txt")
+	if err := os.WriteFile(path, []byte("only one error line\nplain line\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := distGrep(t, []string{real[0], ln.Addr().String()}, "error", grep.Options{LineNumber: true}, path, 25*time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}

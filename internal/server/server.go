@@ -26,6 +26,7 @@ type Server struct {
 	cfg        Config
 	server     *http.Server
 	httpc      *http.Client
+	fragments  *http.Client
 	mu         sync.Mutex
 	collectors map[string]chan protocol.FragmentResult
 }
@@ -41,6 +42,7 @@ func New(cfg Config) *Server {
 		cfg:        cfg,
 		collectors: make(map[string]chan protocol.FragmentResult),
 		httpc:      &http.Client{Timeout: 15 * time.Second},
+		fragments:  &http.Client{Timeout: resultWait},
 	}
 }
 
@@ -108,9 +110,7 @@ func (s *Server) handleFragment(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	res := s.processFragment(req)
-	s.announce(r.Context(), req.Cluster, res)
-	writeJSON(w, res)
+	writeJSON(w, s.processFragment(req))
 }
 
 func (s *Server) handleResult(w http.ResponseWriter, r *http.Request) {
@@ -124,7 +124,7 @@ func (s *Server) handleResult(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	s.deliver(res)
+	s.deliver(r.Context(), res)
 	writeJSON(w, map[string]bool{"ok": true})
 }
 

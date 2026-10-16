@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -162,6 +163,46 @@ func TestDistributedTinyFileNoDuplicateMatches(t *testing.T) {
 	}
 	if len(dist) != 1 {
 		t.Fatalf("tiny file should yield 1 match, got %d: %+v", len(dist), dist)
+	}
+}
+
+func TestTinyFileKeepsMatchWhenReplicaFails(t *testing.T) {
+	real := startTestCluster(t, 1, false)
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"node_id":"fake","healthy":true}`)
+	})
+	mux.HandleFunc("/fragment", func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "injected failure", http.StatusInternalServerError)
+	})
+	mux.HandleFunc("/result", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	fake := &http.Server{Handler: mux}
+	go fake.Serve(ln)
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = fake.Shutdown(ctx)
+	})
+
+	path := filepath.Join(t.TempDir(), "one.txt")
+	if err := os.WriteFile(path, []byte("only one error line\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := distGrep(t, []string{real[0], ln.Addr().String()}, "error", grep.Options{LineNumber: true}, path, 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].Line != "only one error line" || got[0].LineNum != 1 {
+		t.Fatalf("got %+v", got)
 	}
 }
 

@@ -204,8 +204,10 @@ func (s *Server) coordinate(ctx context.Context, req protocol.GrepRequest) proto
 	}
 
 	spares := healthy[len(work):]
+	pending := make(map[int]int)
 	for i, sh := range work {
 		s.dispatchFragment(ctx, cluster, healthy[i], makeFrag(sh))
+		pending[sh.ID]++
 	}
 
 	got := make(map[int]protocol.FragmentResult, len(shards))
@@ -213,22 +215,37 @@ func (s *Server) coordinate(ctx context.Context, req protocol.GrepRequest) proto
 	deadline := time.NewTimer(30 * time.Second)
 	defer deadline.Stop()
 
-	for ok < quorum || len(got) < len(shards) {
+	for len(got) < len(shards) {
 		select {
 		case res := <-results:
+			if pending[res.ShardID] > 0 {
+				pending[res.ShardID]--
+			}
 			if res.Error != "" {
+				if _, already := got[res.ShardID]; already {
+					continue
+				}
+				if pending[res.ShardID] > 0 {
+					continue
+				}
 				if len(spares) == 0 {
 					return out(ok, nil, fmt.Sprintf("shard %d on %s: %s", res.ShardID, res.NodeID, res.Error))
 				}
 				var sh protocol.Shard
+				found := false
 				for _, x := range shards {
 					if x.ID == res.ShardID {
 						sh = x
+						found = true
 						break
 					}
 				}
+				if !found {
+					return out(ok, nil, fmt.Sprintf("unknown shard %d", res.ShardID))
+				}
 				addr := spares[0]
 				spares = spares[1:]
+				pending[sh.ID]++
 				s.dispatchFragment(ctx, cluster, addr, makeFrag(sh))
 				continue
 			}

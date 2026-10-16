@@ -34,7 +34,6 @@ type FragmentRequest struct {
 	ShardID   int          `json:"shard_id"`
 	Filename  string       `json:"filename,omitempty"`
 	Options   grep.Options `json:"options"`
-	Cluster   []string     `json:"cluster"`
 }
 
 type FragmentResult struct {
@@ -121,7 +120,7 @@ func SameNodeAddr(a, b string) bool {
 
 func canonHost(h string) string {
 	switch strings.ToLower(h) {
-	case "", "0.0.0.0", "::", "[::]", "localhost":
+	case "", "0.0.0.0", "::", "localhost":
 		return "127.0.0.1"
 	}
 	return strings.ToLower(h)

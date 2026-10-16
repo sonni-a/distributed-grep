@@ -51,7 +51,6 @@ func (s *Server) Start() error {
 	mux.HandleFunc("/health", s.handleHealth)
 	mux.HandleFunc("/grep", s.handleGrep)
 	mux.HandleFunc("/fragment", s.handleFragment)
-	mux.HandleFunc("/result", s.handleResult)
 
 	s.server = &http.Server{
 		Addr:         s.cfg.Addr,
@@ -111,21 +110,6 @@ func (s *Server) handleFragment(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, s.processFragment(req))
-}
-
-func (s *Server) handleResult(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	var res protocol.FragmentResult
-	if err := json.NewDecoder(r.Body).Decode(&res); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-	s.deliver(r.Context(), res)
-	writeJSON(w, map[string]bool{"ok": true})
 }
 
 func (s *Server) processFragment(req protocol.FragmentRequest) protocol.FragmentResult {

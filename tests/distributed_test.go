@@ -216,9 +216,6 @@ func TestTinyFileKeepsMatchWhenReplicaFails(t *testing.T) {
 	mux.HandleFunc("/fragment", func(w http.ResponseWriter, _ *http.Request) {
 		http.Error(w, "injected failure", http.StatusInternalServerError)
 	})
-	mux.HandleFunc("/result", func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	})
 	fake := &http.Server{Handler: mux}
 	go fake.Serve(ln)
 	t.Cleanup(func() {

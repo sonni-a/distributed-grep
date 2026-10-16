@@ -197,7 +197,6 @@ func (s *Server) coordinate(ctx context.Context, req protocol.GrepRequest) proto
 			ShardID:   sh.ID,
 			Filename:  req.Filename,
 			Options:   req.Options,
-			Cluster:   cluster,
 		}
 	}
 
